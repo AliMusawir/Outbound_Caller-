@@ -12,13 +12,27 @@ from dotenv import load_dotenv
 import uuid
 import threading
 import time
+import os
+from google.cloud import storage
+import pathlib
 
 # Load environment variables
 load_dotenv('.env.local')
 
 # Create Flask app
 app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY', 'your-secret-key-change-this')
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'change-this-secret-key-in-production')
+
+# Recording config
+GCS_BUCKET = os.getenv('GCS_BUCKET')
+GCP_CREDENTIALS_JSON = os.getenv('GCP_CREDENTIALS_JSON')
+
+storage_client = None
+if GCS_BUCKET and GCP_CREDENTIALS_JSON and os.path.exists(GCP_CREDENTIALS_JSON):
+    try:
+        storage_client = storage.Client.from_service_account_json(GCP_CREDENTIALS_JSON)
+    except Exception as e:
+        storage_client = None
 
 class EnhancedCallManager:
     def __init__(self):
@@ -27,8 +41,66 @@ class EnhancedCallManager:
         self.patient_database = {}
         self.scheduler_running = False
         self.start_scheduler()
+        
     
-    def start_call(self, phone_number, patient_name="", priority="normal", notes=""):
+    def _parse_dispatch_output(self, stdout_text):
+        """Best-effort parser for LiveKit CLI dispatch output.
+        Tries JSON first, then falls back to regex-based extraction.
+        Returns a dict with optional keys: dispatch_id, room_name.
+        """
+        info = {}
+        if not stdout_text:
+            return info
+        try:
+            # Try entire output as JSON
+            data = json.loads(stdout_text)
+            # Common keys
+            info['dispatch_id'] = (
+                data.get('id')
+                or data.get('dispatchId')
+                or data.get('dispatch_id')
+            )
+            # Room can be nested or flat
+            info['room_name'] = (
+                (data.get('room') or {}).get('name') if isinstance(data.get('room'), dict) else data.get('room')
+            ) or data.get('room_name') or data.get('roomName')
+            return {k: v for k, v in info.items() if v}
+        except Exception:
+            pass
+        # Try line-by-line JSON
+        for line in stdout_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict):
+                    info['dispatch_id'] = info.get('dispatch_id') or data.get('id') or data.get('dispatchId') or data.get('dispatch_id')
+                    rn = (data.get('room') or {}).get('name') if isinstance(data.get('room'), dict) else data.get('room')
+                    info['room_name'] = info.get('room_name') or rn or data.get('room_name') or data.get('roomName')
+            except Exception:
+                continue
+        # Regex fallback for common patterns
+        try:
+            import re
+            # room name key-value
+            m = re.search(r"room[\s_-]?name\s*[:=]\s*([A-Za-z0-9_-]+)", stdout_text, re.IGNORECASE)
+            if m:
+                info['room_name'] = info.get('room_name') or m.group(1)
+            # dispatch id key-value
+            m = re.search(r"dispatch[\s_-]?id\s*[:=]\s*([A-Za-z0-9_-]+)", stdout_text, re.IGNORECASE)
+            if m:
+                info['dispatch_id'] = info.get('dispatch_id') or m.group(1)
+            # UUID fallback
+            if 'dispatch_id' not in info:
+                m = re.search(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b", stdout_text)
+                if m:
+                    info['dispatch_id'] = m.group(0)
+        except Exception:
+            pass
+        return {k: v for k, v in info.items() if v}
+    
+    def start_call(self, phone_number, patient_name="", priority="normal", notes="", doctor_note: str = ""):
         """Start an outbound call with enhanced metadata"""
         try:
             call_id = str(uuid.uuid4())
@@ -37,7 +109,8 @@ class EnhancedCallManager:
                 "patient_name": patient_name,
                 "priority": priority,
                 "notes": notes,
-                "call_id": call_id
+                "doctor_note": doctor_note,
+                "call_id": call_id,
             })
             
             cmd = [
@@ -50,8 +123,10 @@ class EnhancedCallManager:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
             if result.returncode == 0:
-                dispatch_id = f"call_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                room_name = f"room_{datetime.now().strftime('%H%M%S')}"
+                # Try to parse real IDs from CLI output
+                parsed = self._parse_dispatch_output(result.stdout)
+                dispatch_id = parsed.get('dispatch_id') or f"call_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                room_name = parsed.get('room_name') or f"room_{datetime.now().strftime('%H%M%S')}"
                 
                 call_info = {
                     'call_id': call_id,
@@ -86,7 +161,8 @@ class EnhancedCallManager:
                     'call_id': call_id,
                     'dispatch_id': dispatch_id,
                     'room_name': room_name,
-                    'message': f'Call initiated to {phone_number}'
+                    'message': f'Call initiated to {phone_number}',
+                    'raw_output': result.stdout.strip() if result.stdout else ''
                 }
             else:
                 return {
@@ -99,6 +175,8 @@ class EnhancedCallManager:
                 'success': False,
                 'error': str(e)
             }
+
+    
     
     def schedule_call(self, phone_number, scheduled_time, patient_name="", priority="normal", notes=""):
         """Schedule a call for later"""
@@ -230,6 +308,7 @@ class EnhancedCallManager:
             
             call_notes = []
             
+            # Load JSON files (if any)
             for json_file in notes_dir.glob("*.json"):
                 try:
                     with open(json_file, 'r', encoding='utf-8') as f:
@@ -247,6 +326,59 @@ class EnhancedCallManager:
                         
                         call_notes.append(note_data)
                 except Exception:
+                    continue
+            
+            # Load TXT medical reports
+            for txt_file in notes_dir.glob("*.txt"):
+                try:
+                    # Extract metadata from filename
+                    filename = txt_file.name
+                    if filename.startswith("medical_report_"):
+                        # Parse phone number and timestamp from filename
+                        parts = filename.replace("medical_report_", "").replace(".txt", "").split("_")
+                        if len(parts) >= 2:
+                            phone_number = parts[0]
+                            timestamp_str = "_".join(parts[1:])
+                            
+                            # Try to parse timestamp
+                            try:
+                                timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S").isoformat()
+                            except:
+                                timestamp = datetime.fromtimestamp(txt_file.stat().st_mtime).isoformat()
+                            
+                            # Read file content to extract patient info
+                            with open(txt_file, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                                
+                            # Extract patient name and chief complaint from content
+                            patient_name = "Unknown"
+                            chief_complaint = "Not specified"
+                            
+                            # Parse content for patient info
+                            lines = content.split('\n')
+                            for line in lines:
+                                if "Patient Name:" in line:
+                                    patient_name = line.split("Patient Name:")[1].strip()
+                                elif "Primary Concern:" in line:
+                                    chief_complaint = line.split("Primary Concern:")[1].strip()
+                                elif "Chief Complaint:" in line:
+                                    chief_complaint = line.split("Chief Complaint:")[1].strip()
+                            
+                            note_data = {
+                                'file_name': filename,
+                                'phone_number': phone_number,
+                                'timestamp': timestamp,
+                                'patient_info': {
+                                    'name': patient_name,
+                                    'chief_complaint': chief_complaint
+                                },
+                                'duration': 0,
+                                'status': 'completed'
+                            }
+                            
+                            call_notes.append(note_data)
+                except Exception as e:
+                    print(f"Error processing TXT file {txt_file}: {e}")
                     continue
             
             # Sort by timestamp (newest first)
@@ -348,6 +480,8 @@ def make_call():
         patient_name = data.get('patient_name', '')
         priority = data.get('priority', 'normal')
         notes = data.get('notes', '')
+        doctor_note = data.get('doctor_note', '')
+        
         
         if not phone_number:
             return jsonify({
@@ -355,7 +489,7 @@ def make_call():
                 'error': 'Phone number is required'
             }), 400
         
-        result = call_manager.start_call(phone_number, patient_name, priority, notes)
+        result = call_manager.start_call(phone_number, patient_name, priority, notes, doctor_note)
         return jsonify(result)
             
     except Exception as e:
@@ -440,6 +574,7 @@ def get_patients():
     except Exception as e:
         return jsonify({}), 500
 
+    
 @app.route('/view_note/<filename>')
 def view_note(filename):
     """View a specific call note"""
@@ -454,20 +589,113 @@ def view_note(filename):
                 'success': False,
                 'error': 'Note file not found'
             }), 404
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            note_data = json.load(f)
-        
-        return jsonify({
-            'success': True,
-            'note': note_data
-        })
+        # If JSON file, parse and return
+        if file_path.suffix.lower() == '.json':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                note_data = json.load(f)
+            return jsonify({
+                'success': True,
+                'note': note_data
+            })
+        # If TXT medical report, parse minimal fields and return content
+        elif file_path.suffix.lower() == '.txt':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            # Extract lightweight metadata
+            patient_name = None
+            chief_complaint = None
+            for line in content.split('\n'):
+                if line.startswith('Patient Name:') and not patient_name:
+                    patient_name = line.split('Patient Name:')[1].strip()
+                if (line.startswith('Primary Concern:') or line.startswith('Chief Complaint:')) and not chief_complaint:
+                    chief_complaint = line.split(':', 1)[1].strip()
+            return jsonify({
+                'success': True,
+                'note': {
+                    'file_name': filename,
+                    'content': content,
+                    'patient_info': {
+                        'name': patient_name,
+                        'chief_complaint': chief_complaint
+                    }
+                }
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Unsupported note format'
+            }), 400
         
     except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
+
+# New: list TXT medical reports
+@app.route('/reports')
+def list_reports():
+    try:
+        import pathlib
+        from datetime import datetime
+
+        notes_dir = pathlib.Path(__file__).parent / "call_notes"
+        if not notes_dir.exists():
+            return jsonify([])
+
+        reports = []
+        for txt_file in notes_dir.glob("*.txt"):
+            try:
+                filename = txt_file.name
+                # Try to extract phone and timestamp from the filename pattern
+                phone_number = ""
+                timestamp = datetime.fromtimestamp(txt_file.stat().st_mtime).isoformat()
+                if filename.startswith("medical_report_") and filename.endswith(".txt"):
+                    parts = filename.replace("medical_report_", "").replace(".txt", "").split("_")
+                    if len(parts) >= 2:
+                        phone_number = parts[0]
+                        try:
+                            timestamp = datetime.strptime("_".join(parts[1:]), "%Y%m%d_%H%M%S").isoformat()
+                        except Exception:
+                            pass
+
+                reports.append({
+                    'file_name': filename,
+                    'phone_number': phone_number,
+                    'timestamp': timestamp,
+                    'size': txt_file.stat().st_size,
+                })
+            except Exception:
+                continue
+
+        # newest first
+        reports.sort(key=lambda r: r.get('timestamp', ''), reverse=True)
+        return jsonify(reports)
+    except Exception:
+        return jsonify([]), 500
+
+# New: fetch a single TXT report content
+@app.route('/report/<path:filename>')
+def get_report(filename):
+    try:
+        import pathlib
+        # basic validation to prevent path traversal
+        if (".." in filename) or ("/" in filename) or ("\\" in filename):
+            return jsonify({'success': False, 'error': 'Invalid filename'}), 400
+        if not filename.endswith('.txt'):
+            return jsonify({'success': False, 'error': 'Unsupported file type'}), 400
+
+        notes_dir = pathlib.Path(__file__).parent / "call_notes"
+        file_path = notes_dir / filename
+        if not file_path.exists():
+            return jsonify({'success': False, 'error': 'Report not found'}), 404
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        return jsonify({'success': True, 'file_name': filename, 'content': content})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     print("🚀 Starting Enhanced Outbound Caller Web UI...")
